@@ -8,6 +8,8 @@ import { SearchService } from '@/modules/search/search.service';
 import makeQuestionPrompt from 'src/lib/prompts/make-question.tpl';
 import quickAnswerPrompt from 'src/lib/prompts/quick-answer.tpl';
 import outlinePrompt from 'src/lib/prompts/outline.tpl'
+import subTopicsPrompt from 'src/lib/prompts/sub-topics.tpl'
+import articleTpl from 'src/lib/prompts/article.tpl'
 
 declare global {
     interface ReadableStream<R = any> {
@@ -36,9 +38,12 @@ export class ChatService {
         private readonly configService: ConfigService
     ) {
         this.config = {
-            model_name: this.configService.get('VITE_KIMI_MODEL_NAME'),
-            api_key: this.configService.get('VITE_KIMI_API_KEY'),
-            endpoint: this.configService.get('VITE_KIMI_END_POINT'),
+            model_name: this.configService.get('DP_MODEL_NAME'),
+            api_key: this.configService.get('DP_API_KEY'),
+            endpoint: this.configService.get('DP_END_POINT'),
+            // model_name: this.configService.get('VITE_KIMI_MODEL_NAME'),
+            // api_key: this.configService.get('VITE_KIMI_API_KEY'),
+            // endpoint: this.configService.get('VITE_KIMI_END_POINT'),
             sse: true,
         };
     }
@@ -56,9 +61,11 @@ export class ChatService {
         searchResults = JSON.stringify(await Promise.all(promises));
     }
     const ling = new Ling(this.config);
-    const quickAnswerBot = ling.createBot('quick-answer', {}, {
-        response_format: { type: 'text' }
-    });
+    const quickAnswerBot = ling.createBot('quick-answer', 
+        {       
+        // max_tokens: 4096 * 4,  
+    }, 
+    {        response_format: { type: 'text' }    });
     quickAnswerBot.addPrompt(quickAnswerPrompt, userConfig);
 
     const outlineBot = ling.createBot('outline');
@@ -70,11 +77,35 @@ export class ChatService {
             ling.handleTask(
                 async () => { 
                     if (uri.includes('image_prompt')) { 
-                        const { url } = await this.generateImage(`A full-size picture suitable as a cover for children's picture books that depicts ${delta}. DO NOT use any text or symbols.`);
-                        ling.sendEvent({ uri: 'cover_image', delta: url });
-                        console.log('url', url)
+                        console.log('delta', delta)
+                        const { output } = await this.generateImage(`A full-size picture suitable as a cover for children's picture books that depicts ${delta}. DO NOT use any text or symbols.`);
+                        ling.sendEvent({ uri: 'cover_image', delta: output });
                     } });
             });
+    outlineBot.addListener('inference-done', 
+        (content) => { 
+            const outline = JSON.parse(content); 
+            console.log('outline', outline)
+            delete outline.image_prompt; 
+            const bot = ling.createBot(); 
+            bot.addPrompt(subTopicsPrompt, userConfig); 
+            bot.addFilter(/\/subtopics\//); 
+            bot.chat(JSON.stringify(outline));
+            bot.addListener('inference-done', (content) => {           
+                 const { topics } = JSON.parse(content);            
+                 for (let i = 0; i < topics.length; i++) {                
+                    const topic = topics[i];                
+                    const bot = ling.createBot(`topics/${i}`);                
+                    bot.addPrompt(articleTpl, userConfig);                
+                    bot.addFilter({                    
+                        article_paragraph: true,                    
+                        image_prompt: true,                
+                    });                
+                    bot.addListener('inference-done', (content) => {                    
+                        console.log('inference-done', JSON.parse(content));                
+                    });                
+                    bot.chat(JSON.stringify(topic));            }        });
+        });
 
     if (searchResults) {
         quickAnswerBot.addPrompt(`参考资料:\n${searchResults}`);
@@ -82,7 +113,7 @@ export class ChatService {
     }
 
     quickAnswerBot.chat(question);
-    outlineBot.chat(question);
+    outlineBot.chat(question); 
 
     ling.close();
 
