@@ -1,3 +1,4 @@
+import { Readable } from 'stream';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CozeAPI, RoleType } from '@coze/api';
@@ -5,12 +6,19 @@ import { ChatConfig, Ling } from '@bearbobo/ling';
 import { Response } from 'express';
 import { LingService } from '@/modules/ling/ling.service';
 import { SearchService } from '@/modules/search/search.service';
+import { RadioDto } from './chat.dto'
+import { writeFileSync } from 'fs';
 import makeQuestionPrompt from 'src/lib/prompts/make-question.tpl';
 import quickAnswerPrompt from 'src/lib/prompts/quick-answer.tpl';
 import outlinePrompt from 'src/lib/prompts/outline.tpl'
 import subTopicsPrompt from 'src/lib/prompts/sub-topics.tpl'
 import articleTpl from 'src/lib/prompts/article.tpl'
+import podcastTpl from 'src/lib/prompts/podcast.tpl'
 
+interface AudioBuffers {
+  [key: string]: Buffer;
+}
+const audioBuffers: AudioBuffers = {};
 declare global {
     interface ReadableStream<R = any> {
         readonly locked: boolean;
@@ -78,14 +86,14 @@ export class ChatService {
                 async () => { 
                     if (uri.includes('image_prompt')) { 
                         console.log('delta', delta)
-                        const { output } = await this.generateImage(`A full-size picture suitable as a cover for children's picture books that depicts ${delta}. DO NOT use any text or symbols.`);
-                        ling.sendEvent({ uri: 'cover_image', delta: output });
+                        // const res = await this.generateImage(`A full-size picture suitable as a cover for children's picture books that depicts ${delta}. DO NOT use any text or symbols.`);
+                        // console.log('res', res)
+                        // ling.sendEvent({ uri: 'cover_image', delta: res.output });
                     } });
             });
     outlineBot.addListener('inference-done', 
         (content) => { 
             const outline = JSON.parse(content); 
-            console.log('outline', outline)
             delete outline.image_prompt; 
             const bot = ling.createBot(); 
             bot.addPrompt(subTopicsPrompt, userConfig); 
@@ -100,11 +108,34 @@ export class ChatService {
                     bot.addFilter({                    
                         article_paragraph: true,                    
                         image_prompt: true,                
-                    });                
+                    });      
+                    bot.addListener('string-response', (res) => {
+                        const { uri, delta } = res
+                        console.log('uri', uri)
+                        if(uri.endsWith('article_paragraph')){
+                            console.log('article_paragraph', delta)
+                            const podcastBot = ling.createBot('', undefined, { 
+                                quiet: true, 
+                                response_format: { type: 'text' } 
+                            });
+                            podcastBot.addPrompt(podcastTpl, userConfig); 
+                            podcastBot.chat(delta); 
+                            podcastBot.addListener('inference-done', (content) => { 
+                                console.log(content); 
+                                ling.handleTask(async () => { 
+                                        // const tmpId = await this.generateAudio({ input:content }); 
+                                        // console.log('create audio', `/chat/get-audio?id=${tmpId}`); 
+                                        // ling.sendEvent({ uri: `topics/${i}/audio`, delta: `/chat/get-audio?id=${tmpId}` }); 
+                                }); 
+                            });
+                        }
+                    })          
                     bot.addListener('inference-done', (content) => {                    
                         console.log('inference-done', JSON.parse(content));                
                     });                
-                    bot.chat(JSON.stringify(topic));            }        });
+                    bot.chat(JSON.stringify(topic));            
+                }        
+            });
         });
 
     if (searchResults) {
@@ -158,14 +189,12 @@ export class ChatService {
 
   async streamQuestion(question: string,  res: Response) {
     const { stream } = await this.lingService.createChatStream(question);
-    console.log('stream', question);
     if ('locked' in stream && stream.locked) {
         throw new Error('流已被锁定');
       }
     const reader = (stream as unknown as ReadableStream).getReader();
     const abortController = new AbortController();
     const cleanup = () => {
-        console.log('cleanup', cleanup)
         if (!reader || reader.closed) return;
         
         try {
@@ -210,7 +239,6 @@ export class ChatService {
         const promises = queries.map((query) => this.searchService.search(query)); 
         searchResults = JSON.stringify(await Promise.all(promises)); 
     }
-    console.log('searchResults', searchResults)
     const { stream } = await this.lingService.quickAnswer(question, searchResults);
    
     // if ('locked' in stream && stream.locked) {
@@ -260,7 +288,7 @@ export class ChatService {
                 "input": prompt
             }
         })
-        console.log('generate Image', res)
+        console.log('generateImage', res)
         return JSON.parse(res.data)
     } catch (error) {
         console.log('generate Image error', error)
@@ -268,6 +296,67 @@ export class ChatService {
     }
   
   }
+  async generateAudio (data)  {
+    const { input, voice_id } = data;
+    const endpoint = 'https://api.coze.cn/v1/audio/speech';
+    const headers = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.VITE_COZE_API_KET}`,
+    };
+
+    const payload = {
+        input: input,
+        voice_id: voice_id || process.env.VITE_COZE_VOICE_ID,
+        response_format:'mp3'
+    };
+
+    const res = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`API请求失败: ${res.status} - ${errorText}`);
+    }
+     const audioBuffer = await res.arrayBuffer();
+      writeFileSync(`./audio_${Date.now()}.mp3`, Buffer.from(audioBuffer));
+      // 替换原来的json解析方式
+    const tmpId = Math.random().toString(36).substring(7);          
+    audioBuffers[tmpId] = Buffer.from(audioBuffer);
+    return tmpId
+}
+
+    async getAudio(tmpId) {
+        const audioData = audioBuffers[tmpId]; 
+        const buffer = audioData;
+        const bufferSize = audioData.length;
+        
+        // 处理范围请求
+        let start = 0;
+        let end = bufferSize - 1;
+
+        const contentLength = end - start + 1;
+        const readable = new Readable({
+            read() {
+                this.push(buffer.subarray(start, end + 1));
+                this.push(null);
+            }
+        });
+
+        return {
+            stream: readable,
+            headers: {
+                'Content-Length': contentLength,
+                'Content-Range': `bytes ${start}-${end}/${bufferSize}`,
+                'Cache-Control': 'max-age=3600'
+            }
+        };
+        // if (!audioData) { 
+        //     throw new Error('audio not found');
+        // }
+        // return audioData
+    }
 
   private async *readStream(reader: ReadableStreamDefaultReader, signal: AbortSignal) {
     while (!signal.aborted) {
